@@ -7,3 +7,9 @@ edition = "2021"
 tokio = { version = "1.29", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+roles_logic_sv2 = { git = "https://github.com/stratum-mining/stratum", rev = "ea139a7c403344e9c7cdbf0c8032c52dcd4d7b2b", package = "roles_logic_sv2" }
+network_helpers_sv2 = { git = "https://github.com/stratum-mining/stratum", rev = "ea139a7c403344e9c7cdbf0c8032c52dcd4d7b2b", package = "network_helpers_sv2" }
+binary_sv2 = { git = "https://github.com/stratum-mining/stratum", rev = "ea139a7c403344e9c7cdbf0c8032c52dcd4d7b2b", package = "binary_sv2" }
+codec_sv2 = { git = "https://github.com/stratum-mining/stratum", rev = "ea139a7c403344e9c7cdbf0c8032c52dcd4d7b2b", package = "codec_sv2" }
+async-channel = "1.8.0" # used by sv2...

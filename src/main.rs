@@ -12,8 +12,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let rt = Runtime::new()?;
 
     let args: Vec<String> = std::env::args().collect();
-    let upstream_addr = args.get(1).expect("Missing upstream address argument").clone();
-    let worker_name   = args.get(2).expect("Missing worker name argument").clone();
+    let upstream_addr = args
+        .get(1)
+        .expect("Missing upstream address argument")
+        .clone();
+    let worker_name = args.get(2).expect("Missing worker name argument").clone();
 
     let on_new_block = Arc::new(|block_msg: String| {
         println!("(Callback) A new block arrived: {}", block_msg);
@@ -31,6 +34,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             &worker_name,
             on_new_block,
             on_share_submitted,
-        ).await
+        )
+        .await
     })
 }

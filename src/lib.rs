@@ -1,10 +1,30 @@
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, AsyncBufReadExt};
-use tokio::sync::{broadcast, mpsc, Mutex};
-use serde_json::{Value, json};
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use async_channel::{Receiver, SendError, Sender};
+use codec_sv2::{buffer_sv2, StandardEitherFrame, StandardSv2Frame};
+use network_helpers_sv2::plain_connection::PlainConnection;
+use roles_logic_sv2::common_messages_sv2::{SetupConnection, SetupConnectionSuccess};
+use roles_logic_sv2::common_properties::{CommonDownstreamData, IsDownstream, IsMiningDownstream};
+use roles_logic_sv2::handlers::common::{ParseDownstreamCommonMessages, SendTo as SendToCommon};
+use roles_logic_sv2::handlers::mining::{
+    ParseDownstreamMiningMessages, SendTo, SupportedChannelTypes,
+};
+use roles_logic_sv2::mining_sv2::{
+    OpenExtendedMiningChannel, OpenStandardMiningChannel, SetCustomMiningJob, SubmitSharesExtended,
+    SubmitSharesStandard, UpdateChannel,
+};
+use roles_logic_sv2::parsers::{AnyMessage, Mining, MiningDeviceMessages};
+use roles_logic_sv2::routing_logic::MiningProxyRoutingLogic;
+use roles_logic_sv2::utils::Mutex as Sv2Mutex;
+use roles_logic_sv2::errors::Error as Sv2Error;
+use serde_json::{json, Value};
 use std::error::Error;
-use std::env;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::oneshot::Receiver as TokioReceiver;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{broadcast, mpsc, Mutex};
 
 // Structure to hold upstream job parameters.
 #[derive(Clone, Debug)]
@@ -45,7 +65,9 @@ pub async fn run_proxy(
         "params": [["version-rolling"], {"version-rolling.mask": "1fffe000"}]
     })
     .to_string();
-    upstream_stream.write_all(configure_message.as_bytes()).await?;
+    upstream_stream
+        .write_all(configure_message.as_bytes())
+        .await?;
     upstream_stream.write_all(b"\n").await?;
     upstream_stream.flush().await?;
     println!("Sent configure request to upstream.");
@@ -57,7 +79,9 @@ pub async fn run_proxy(
         "params": []
     })
     .to_string();
-    upstream_stream.write_all(subscribe_message.as_bytes()).await?;
+    upstream_stream
+        .write_all(subscribe_message.as_bytes())
+        .await?;
     upstream_stream.write_all(b"\n").await?;
     upstream_stream.flush().await?;
     println!("Sent subscribe request to upstream.");
@@ -69,7 +93,9 @@ pub async fn run_proxy(
         "params": [worker_name, "x"]  // Replace "x" with a password if needed.
     })
     .to_string();
-    upstream_stream.write_all(authorize_message.as_bytes()).await?;
+    upstream_stream
+        .write_all(authorize_message.as_bytes())
+        .await?;
     upstream_stream.write_all(b"\n").await?;
     upstream_stream.flush().await?;
     println!("Sent authorize request to upstream.");
@@ -81,7 +107,9 @@ pub async fn run_proxy(
         "params": [1000.0]  // Replace with the desired difficulty
     })
     .to_string();
-    upstream_stream.write_all(suggest_difficulty_message.as_bytes()).await?;
+    upstream_stream
+        .write_all(suggest_difficulty_message.as_bytes())
+        .await?;
     upstream_stream.write_all(b"\n").await?;
     upstream_stream.flush().await?;
     println!("Sent suggest_difficulty request to upstream.");
@@ -107,7 +135,16 @@ pub async fn run_proxy(
         let last_difficulty = last_difficulty.clone();
         let last_prev_hash = last_prev_hash.clone();
         tokio::spawn(async move {
-            upstream_read_handler(upstream_reader, job_tx, job_params, last_notify, last_difficulty, on_new_block, last_prev_hash).await;
+            upstream_read_handler(
+                upstream_reader,
+                job_tx,
+                job_params,
+                last_notify,
+                last_difficulty,
+                on_new_block,
+                last_prev_hash,
+            )
+            .await;
         });
     }
 
@@ -123,6 +160,50 @@ pub async fn run_proxy(
     let listener = TcpListener::bind(local_addr).await?;
     println!("Listening for miners on {}", local_addr);
 
+    // Listen for SV2 miner connections on a different port
+    let local_addr_sv2 = "0.0.0.0:3335"; // A separate port for SV2 miners
+    let listener_sv2 = TcpListener::bind(local_addr_sv2).await?;
+    println!("Listening for SV2 miners on {}", local_addr_sv2);
+
+    // Spawn task to handle SV2 connections
+    {
+        let job_tx = job_tx.clone();
+        let share_tx = share_tx.clone();
+        let job_params = job_params.clone();
+        let last_notify = last_notify.clone();
+        let last_difficulty = last_difficulty.clone();
+        let worker_name = worker_name.to_string();
+        let on_share_submitted = on_share_submitted.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let (miner_socket, addr) = listener_sv2.accept().await.unwrap();
+                println!("Accepted SV2 miner connection from {}", addr);
+                let job_tx = job_tx.clone();
+                let share_tx = share_tx.clone();
+                let job_params = job_params.clone();
+                let last_notify = last_notify.clone();
+                let last_difficulty = last_difficulty.clone();
+                let worker_name = worker_name.to_string();
+                let on_share_submitted = on_share_submitted.clone();
+                tokio::spawn(async move {
+                    handle_miner_sv2(
+                        miner_socket,
+                        job_tx.subscribe(),
+                        share_tx,
+                        job_params,
+                        last_notify,
+                        last_difficulty,
+                        worker_name,
+                        on_share_submitted,
+                    )
+                    .await;
+                });
+            }
+        });
+    }
+
+    // Handle original SV1 connections
     loop {
         let (miner_socket, addr) = listener.accept().await?;
         println!("Accepted miner connection from {}", addr);
@@ -134,7 +215,17 @@ pub async fn run_proxy(
         let worker_name = worker_name.to_string();
         let on_share_submitted = on_share_submitted.clone();
         tokio::spawn(async move {
-            handle_miner(miner_socket, job_tx.subscribe(), share_tx, job_params, last_notify, last_difficulty, worker_name, on_share_submitted).await;
+            handle_miner(
+                miner_socket,
+                job_tx.subscribe(),
+                share_tx,
+                job_params,
+                last_notify,
+                last_difficulty,
+                worker_name,
+                on_share_submitted,
+            )
+            .await;
         });
     }
 }
@@ -173,13 +264,13 @@ async fn upstream_read_handler(
                         if method == "mining.notify" {
                             if let Some(params) = val.get("params").and_then(|p| p.as_array()) {
                                 if let Some(prevhash_json) = params.get(1) {
-                                    let new_prevhash = prevhash_json.as_str().unwrap_or("").to_string();
-
+                                    let new_prevhash =
+                                        prevhash_json.as_str().unwrap_or("").to_string();
 
                                     let mut last_hash_guard = last_prev_hash.lock().await;
                                     let changed = match &*last_hash_guard {
                                         Some(old_hash) => *old_hash != new_prevhash,
-                                        None           => true,
+                                        None => true,
                                     };
 
                                     if changed {
@@ -247,7 +338,10 @@ async fn upstream_read_handler(
                                         lock.clone()
                                     };
                                     if let Some(notify_msg) = cached {
-                                        println!("Broadcasting cached mining.notify after authorize: {}", notify_msg);
+                                        println!(
+                                            "Broadcasting cached mining.notify after authorize: {}",
+                                            notify_msg
+                                        );
                                         let _ = job_tx.send(notify_msg);
                                     }
                                 } else {
@@ -287,7 +381,7 @@ async fn upstream_write_handler(
 }
 
 /// Handles a miner connection:
-/// - Responds to the miner’s subscribe with a constrained extranonce.
+/// - Responds to the miner's subscribe with a constrained extranonce.
 /// - Sends the current cached mining.notify if available.
 /// - Forwards mining.notify messages (modified for the miner) and transforms share submissions.
 async fn handle_miner(
@@ -302,13 +396,16 @@ async fn handle_miner(
 ) {
     let miner_id = MINER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let constrained_extranonce = format!("{:04x}", miner_id);
-    println!("Assigned constrained extranonce {} to miner {}", constrained_extranonce, miner_id);
+    println!(
+        "Assigned constrained extranonce {} to miner {}",
+        constrained_extranonce, miner_id
+    );
 
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
 
-    // Read the miner’s configure request.
+    // Read the miner's configure request.
     if let Ok(n) = reader.read_line(&mut line).await {
         if n > 0 {
             println!("Miner {} sent: {}", miner_id, line.trim_end());
@@ -324,7 +421,10 @@ async fn handle_miner(
             });
             let response_str = serde_json::to_string(&configure_response).unwrap();
             if let Err(e) = writer.write_all(response_str.as_bytes()).await {
-                println!("Error writing configure response to miner {}: {:?}", miner_id, e);
+                println!(
+                    "Error writing configure response to miner {}: {:?}",
+                    miner_id, e
+                );
                 return;
             }
             if let Err(e) = writer.write_all(b"\n").await {
@@ -343,7 +443,7 @@ async fn handle_miner(
         return;
     }
 
-    // Read the miner’s subscribe request.
+    // Read the miner's subscribe request.
     if let Ok(n) = reader.read_line(&mut line).await {
         if n > 0 {
             println!("Miner {} sent: {}", miner_id, line.trim_end());
@@ -372,7 +472,10 @@ async fn handle_miner(
             });
             let response_str = serde_json::to_string(&subscribe_response).unwrap();
             if let Err(e) = writer.write_all(response_str.as_bytes()).await {
-                println!("Error writing subscribe response to miner {}: {:?}", miner_id, e);
+                println!(
+                    "Error writing subscribe response to miner {}: {:?}",
+                    miner_id, e
+                );
                 return;
             }
             if let Err(e) = writer.write_all(b"\n").await {
@@ -391,7 +494,7 @@ async fn handle_miner(
         return;
     }
 
-    // Read the miner’s authorize request.
+    // Read the miner's authorize request.
     if let Ok(n) = reader.read_line(&mut line).await {
         if n > 0 {
             println!("Miner {} sent: {}", miner_id, line.trim_end());
@@ -404,7 +507,10 @@ async fn handle_miner(
             });
             let response_str = serde_json::to_string(&authorize_response).unwrap();
             if let Err(e) = writer.write_all(response_str.as_bytes()).await {
-                println!("Error writing authorize response to miner {}: {:?}", miner_id, e);
+                println!(
+                    "Error writing authorize response to miner {}: {:?}",
+                    miner_id, e
+                );
                 return;
             }
             if let Err(e) = writer.write_all(b"\n").await {
@@ -417,7 +523,6 @@ async fn handle_miner(
             }
             println!("Response to Miner {}: {}", miner_id, response_str);
             line.clear();
-
         }
     } else {
         println!("Failed to read authorize request from miner {}", miner_id);
@@ -430,7 +535,10 @@ async fn handle_miner(
         lock.clone()
     };
     if let Some(difficulty_msg) = cached_difficulty {
-        println!("Sending cached mining.set_difficulty to miner {}: {}", miner_id, difficulty_msg);
+        println!(
+            "Sending cached mining.set_difficulty to miner {}: {}",
+            miner_id, difficulty_msg
+        );
         if let Err(e) = writer.write_all(difficulty_msg.as_bytes()).await {
             println!("Error sending difficulty to miner {}: {:?}", miner_id, e);
         }
@@ -443,7 +551,10 @@ async fn handle_miner(
         lock.clone()
     };
     if let Some(notify) = cached_notify {
-        println!("Sending cached mining.notify to miner {}: {}", miner_id, notify);
+        println!(
+            "Sending cached mining.notify to miner {}: {}",
+            miner_id, notify
+        );
         if let Err(e) = writer.write_all(notify.as_bytes()).await {
             println!("Error sending notify to miner {}: {:?}", miner_id, e);
         }
@@ -535,8 +646,13 @@ async fn handle_miner(
     }
 }
 
-/// Transforms a miner’s share submission by replacing the constrained extranonce with the full upstream extranonce.
-fn transform_share_submission(submission: &str, constrained_extranonce: &str, full_extranonce: &str, worker_name: &str) -> String {
+/// Transforms a miner's share submission by replacing the constrained extranonce with the full upstream extranonce.
+fn transform_share_submission(
+    submission: &str,
+    constrained_extranonce: &str,
+    full_extranonce: &str,
+    worker_name: &str,
+) -> String {
     if let Ok(mut value) = serde_json::from_str::<Value>(submission) {
         if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
             if method == "mining.submit" {
@@ -544,7 +660,8 @@ fn transform_share_submission(submission: &str, constrained_extranonce: &str, fu
                     if params.len() >= 2 {
                         params[0] = Value::String(worker_name.to_string());
                         if let Some(extranonce_2) = params.get(2).and_then(|v| v.as_str()) {
-                            params[2] = Value::String(constrained_extranonce.to_string() + extranonce_2);
+                            params[2] =
+                                Value::String(constrained_extranonce.to_string() + extranonce_2);
                         }
                     }
                 }
@@ -555,3 +672,484 @@ fn transform_share_submission(submission: &str, constrained_extranonce: &str, fu
         submission.to_string()
     }
 }
+
+// SV2
+
+pub type Message = MiningDeviceMessages<'static>;
+pub type StdFrame = StandardSv2Frame<Message>;
+pub type EitherFrame = StandardEitherFrame<Message>;
+
+/// 1 to 1 connection with a downstream node that implement the mining (sub)protocol can be either
+/// a mining device or a downstream proxy.
+/// A downstream can only be linked with an upstream at a time. Support multi upstreams for
+/// downstream do not make much sense.
+#[derive(Debug)]
+pub struct DownstreamMiningNode {
+    id: u32,
+    receiver: Receiver<EitherFrame>,
+    sender: Sender<EitherFrame>,
+    pub status: DownstreamMiningNodeStatus,
+    upstream: Option<Arc<Sv2Mutex<UpstreamMiningNode>>>,
+}
+
+#[derive(Debug)]
+pub enum DownstreamMiningNodeStatus {
+    Initializing,
+    Paired(CommonDownstreamData),
+    ChannelOpened(Channel),
+}
+
+#[derive(Debug, Clone)]
+#[allow(clippy::enum_variant_names)]
+pub enum Channel {
+    DownstreamHomUpstreamGroup {
+        data: CommonDownstreamData,
+        channel_id: u32,
+        group_id: u32,
+    },
+    DownstreamHomUpstreamExtended {
+        data: CommonDownstreamData,
+        channel_id: u32,
+    },
+}
+
+
+impl DownstreamMiningNodeStatus {
+    fn is_paired(&self) -> bool {
+        match self {
+            DownstreamMiningNodeStatus::Initializing => false,
+            DownstreamMiningNodeStatus::Paired(_) => true,
+            DownstreamMiningNodeStatus::ChannelOpened(_) => true,
+        }
+    }
+
+    fn pair(&mut self, data: CommonDownstreamData) {
+        match self {
+            DownstreamMiningNodeStatus::Initializing => {
+                let self_ = Self::Paired(data);
+                let _ = std::mem::replace(self, self_);
+            }
+            _ => panic!("Try to pair an already paired downstream"),
+        }
+    }
+
+    pub fn get_channel(&mut self) -> &mut Channel {
+        match self {
+            DownstreamMiningNodeStatus::Initializing => {
+                panic!("Downstream is not initialized no channel opened yet")
+            }
+            DownstreamMiningNodeStatus::Paired(_channels) => {
+                panic!("Downstream is paired but not channel opened yet")
+            }
+            DownstreamMiningNodeStatus::ChannelOpened(k) => k,
+        }
+    }
+
+    fn open_channel_for_down_hom_up_group(&mut self, channel_id: u32, group_id: u32) {
+        match self {
+            DownstreamMiningNodeStatus::Initializing => panic!(),
+            DownstreamMiningNodeStatus::Paired(data) => {
+                let channel = Channel::DownstreamHomUpstreamGroup {
+                    data: *data,
+                    channel_id,
+                    group_id,
+                };
+                let self_ = Self::ChannelOpened(channel);
+                let _ = std::mem::replace(self, self_);
+            }
+            DownstreamMiningNodeStatus::ChannelOpened(..) => panic!("Channel already opened"),
+        }
+    }
+
+    fn open_channel_for_down_hom_up_extended(&mut self, channel_id: u32, _group_id: u32) {
+        match self {
+            DownstreamMiningNodeStatus::Initializing => panic!(),
+            DownstreamMiningNodeStatus::Paired(data) => {
+                let channel = Channel::DownstreamHomUpstreamExtended {
+                    data: *data,
+                    channel_id,
+                };
+                let self_ = Self::ChannelOpened(channel);
+                let _ = std::mem::replace(self, self_);
+            }
+            DownstreamMiningNodeStatus::ChannelOpened(..) => panic!("Channel already opened"),
+        }
+    }
+}
+
+impl PartialEq for DownstreamMiningNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl DownstreamMiningNode {
+    /// Return mining channel specific data
+    pub fn get_channel(&mut self) -> &mut Channel {
+        self.status.get_channel()
+    }
+
+    pub fn open_channel_for_down_hom_up_group(&mut self, channel_id: u32, group_id: u32) {
+        self.status
+            .open_channel_for_down_hom_up_group(channel_id, group_id);
+    }
+    pub fn open_channel_for_down_hom_up_extended(&mut self, channel_id: u32, group_id: u32) {
+        self.status
+            .open_channel_for_down_hom_up_extended(channel_id, group_id);
+    }
+
+    pub fn new(receiver: Receiver<EitherFrame>, sender: Sender<EitherFrame>, id: u32) -> Self {
+        Self {
+            receiver,
+            sender,
+            status: DownstreamMiningNodeStatus::Initializing,
+            upstream: None,
+            id,
+        }
+    }
+
+    /// Send SetupConnectionSuccess to downstream and start processing new messages coming from
+    /// downstream
+    pub async fn start(
+        self_mutex: Arc<Sv2Mutex<Self>>,
+        setup_connection_success: SetupConnectionSuccess,
+    ) {
+        if self_mutex
+            .safe_lock(|self_| self_.status.is_paired())
+            .unwrap()
+        {
+            let setup_connection_success: MiningDeviceMessages = setup_connection_success.into();
+
+            {
+                DownstreamMiningNode::send(
+                    self_mutex.clone(),
+                    setup_connection_success.try_into().unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+            let receiver = self_mutex
+                .safe_lock(|self_| self_.receiver.clone())
+                .unwrap();
+
+            while let Ok(message) = receiver.recv().await {
+                let incoming: StdFrame = message.try_into().unwrap();
+                Self::next(self_mutex.clone(), incoming).await;
+            }
+            Self::exit(self_mutex);
+        } else {
+            panic!()
+        }
+    }
+
+    /// Parse the received message and relay it to the right upstream
+    pub async fn next(self_mutex: Arc<Sv2Mutex<Self>>, mut incoming: StdFrame) {
+        let message_type = incoming.get_header().unwrap().msg_type();
+        let payload = incoming.payload();
+
+        let routing_logic = super::get_routing_logic();
+
+        let next_message_to_send = ParseDownstreamMiningMessages::handle_message_mining(
+            self_mutex.clone(),
+            message_type,
+            payload,
+            routing_logic,
+        );
+
+        match next_message_to_send {
+            Ok(SendTo::RelaySameMessageToRemote(upstream_mutex)) => {
+                let sv2_frame: codec_sv2::Sv2Frame<AnyMessage, buffer_sv2::Slice> =
+                    incoming.map(|payload| payload.try_into().unwrap());
+                UpstreamMiningNode::send(upstream_mutex.clone(), sv2_frame)
+                    .await
+                    .unwrap();
+            }
+            Ok(SendTo::RelayNewMessageToRemote(upstream_mutex, message)) => {
+                let message = AnyMessage::Mining(message);
+                let frame: UpstreamFrame = message.try_into().unwrap();
+                UpstreamMiningNode::send(upstream_mutex.clone(), frame)
+                    .await
+                    .unwrap();
+            }
+            Ok(SendTo::Respond(message)) => {
+                let message = MiningDeviceMessages::Mining(message);
+                let frame: StdFrame = message.try_into().unwrap();
+                DownstreamMiningNode::send(self_mutex.clone(), frame)
+                    .await
+                    .unwrap();
+            }
+            Ok(SendTo::Multiple(sends_to)) => {
+                for message in sends_to {
+                    match message {
+                        roles_logic_sv2::handlers::SendTo_::Respond(m) => match m {
+                            Mining::NewMiningJob(_) => {
+                                let message = MiningDeviceMessages::Mining(m);
+                                let frame: StdFrame = message.try_into().unwrap();
+                                DownstreamMiningNode::send(self_mutex.clone(), frame)
+                                    .await
+                                    .unwrap();
+                            }
+                            Mining::OpenStandardMiningChannelSuccess(_) => {
+                                let message = MiningDeviceMessages::Mining(m);
+                                let frame: StdFrame = message.try_into().unwrap();
+                                DownstreamMiningNode::send(self_mutex.clone(), frame)
+                                    .await
+                                    .unwrap();
+                            }
+                            Mining::SetNewPrevHash(_) => {
+                                let message = MiningDeviceMessages::Mining(m);
+                                let frame: StdFrame = message.try_into().unwrap();
+                                DownstreamMiningNode::send(self_mutex.clone(), frame)
+                                    .await
+                                    .unwrap();
+                            }
+                            m => panic!("{:?}", m),
+                        },
+                        m => panic!("{:?}", m),
+                    }
+                }
+            }
+            Ok(SendTo::None(_)) => (),
+            Ok(_) => panic!(),
+            Err(_) => todo!(),
+        }
+    }
+
+    /// Send a message downstream
+    pub async fn send(
+        self_mutex: Arc<Sv2Mutex<Self>>,
+        sv2_frame: StdFrame,
+    ) -> Result<(), SendError<StdFrame>> {
+        let either_frame = sv2_frame.into();
+        let sender = self_mutex.safe_lock(|self_| self_.sender.clone()).unwrap();
+        match sender.send(either_frame).await {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                todo!()
+            }
+        }
+    }
+
+    pub fn exit(self_: Arc<Sv2Mutex<Self>>) {
+        if let Some(up) = self_.safe_lock(|s| s.upstream.clone()).unwrap() {
+            UpstreamMiningNode::remove_dowstream(up, &self_);
+        };
+        self_
+            .safe_lock(|s| {
+                s.receiver.close();
+            })
+            .unwrap();
+    }
+}
+
+/// It impl UpstreamMining cause the proxy act as an upstream node for the DownstreamMiningNode
+impl
+    ParseDownstreamMiningMessages<
+        UpstreamMiningNode,
+        ProxyRemoteSelector,
+        MiningProxyRoutingLogic<Self, UpstreamMiningNode, ProxyRemoteSelector>,
+    > for DownstreamMiningNode
+{
+    fn get_channel_type(&self) -> SupportedChannelTypes {
+        SupportedChannelTypes::Group
+    }
+
+    fn is_work_selection_enabled(&self) -> bool {
+        false
+    }
+
+    fn is_downstream_authorized(
+        _self_mutex: Arc<Sv2Mutex<Self>>,
+        _user_identity: &binary_sv2::Str0255,
+    ) -> Result<bool, Sv2Error> {
+        Ok(true)
+    }
+
+    fn handle_open_standard_mining_channel(
+        &mut self,
+        req: OpenStandardMiningChannel,
+        up: Option<Arc<Sv2Mutex<UpstreamMiningNode>>>,
+    ) -> Result<SendTo<UpstreamMiningNode>, Sv2Error> {
+        let channel_id = up
+            .as_ref()
+            .expect("No upstream initialized")
+            .safe_lock(|s| s.channel_ids.safe_lock(|r| r.next()).unwrap())
+            .unwrap();
+        println!("{}", channel_id);
+        let cloned = up.as_ref().expect("No upstream initialized").clone();
+        up.as_ref()
+            .expect("No upstream initialized")
+            .safe_lock(|up| {
+                if up.channel_kind.is_extended() {
+                    let messages = up.open_standard_channel_down(
+                        req.request_id.as_u32(),
+                        req.nominal_hash_rate,
+                        true,
+                        channel_id,
+                    );
+                    for m in &messages {
+                        if let Mining::OpenStandardMiningChannelSuccess(m) = m {
+                            self.open_channel_for_down_hom_up_extended(
+                                m.channel_id,
+                                m.group_channel_id,
+                            );
+                        }
+                    }
+                    let messages = messages.into_iter().map(SendTo::Respond).collect();
+                    Ok(SendTo::Multiple(messages))
+                } else {
+                    Ok(SendTo::RelaySameMessageToRemote(cloned))
+                }
+            })
+            .unwrap()
+    }
+
+    fn handle_open_extended_mining_channel(
+        &mut self,
+        _: OpenExtendedMiningChannel,
+    ) -> Result<SendTo<UpstreamMiningNode>, Sv2Error> {
+        todo!()
+    }
+
+    fn handle_update_channel(
+        &mut self,
+        _: UpdateChannel,
+    ) -> Result<SendTo<UpstreamMiningNode>, Sv2Error> {
+        todo!()
+    }
+
+    fn handle_submit_shares_standard(
+        &mut self,
+        m: SubmitSharesStandard,
+    ) -> Result<SendTo<UpstreamMiningNode>, Sv2Error> {
+        // TODO maybe we want to check if shares meet target before
+        // sending them upstream If that is the case it should be
+        // done by GroupChannel not here
+        match &self.status {
+            DownstreamMiningNodeStatus::Initializing => todo!(),
+            DownstreamMiningNodeStatus::Paired(_) => todo!(),
+            DownstreamMiningNodeStatus::ChannelOpened(Channel::DownstreamHomUpstreamGroup {
+                ..
+            }) => {
+                let remote = self.upstream.as_ref().unwrap();
+                let message = Mining::SubmitSharesStandard(m);
+                Ok(SendTo::RelayNewMessageToRemote(remote.clone(), message))
+            }
+            DownstreamMiningNodeStatus::ChannelOpened(Channel::DownstreamHomUpstreamExtended {
+                ..
+            }) => {
+                // Safe unwrap is channel have been opened it means that the downstream is paired
+                // with an upstream
+                let remote = self.upstream.as_ref().unwrap();
+                let res = UpstreamMiningNode::handle_std_shr(remote.clone(), m).unwrap();
+                Ok(SendTo::Respond(res))
+            }
+        }
+    }
+
+    fn handle_submit_shares_extended(
+        &mut self,
+        _: SubmitSharesExtended,
+    ) -> Result<SendTo<UpstreamMiningNode>, Sv2Error> {
+        todo!()
+    }
+
+    fn handle_set_custom_mining_job(
+        &mut self,
+        _: SetCustomMiningJob,
+    ) -> Result<SendTo<UpstreamMiningNode>, Sv2Error> {
+        todo!()
+    }
+}
+
+impl
+    ParseDownstreamCommonMessages<
+        MiningProxyRoutingLogic<Self, UpstreamMiningNode, ProxyRemoteSelector>,
+    > for DownstreamMiningNode
+{
+    fn handle_setup_connection(
+        &mut self,
+        _: SetupConnection,
+        result: Option<Result<(CommonDownstreamData, SetupConnectionSuccess), Sv2Error>>,
+    ) -> Result<roles_logic_sv2::handlers::common::SendTo, Sv2Error> {
+        let (data, message) = result.unwrap().unwrap();
+        let upstream = match super::get_routing_logic() {
+            roles_logic_sv2::routing_logic::MiningRoutingLogic::Proxy(proxy_routing) => {
+                proxy_routing
+                    .safe_lock(|r| r.downstream_to_upstream_map.get(&data).unwrap()[0].clone())
+                    .unwrap()
+            }
+            _ => unreachable!(),
+        };
+        self.upstream = Some(upstream);
+
+        self.status.pair(data);
+        Ok(SendToCommon::RelayNewMessageToRemote(
+            Arc::new(Sv2Mutex::new(())),
+            message.into(),
+        ))
+    }
+}
+
+pub async fn listen_for_downstream_mining(
+    listener: TcpListener,
+    mut shutdown_rx: TokioReceiver<()>,
+) {
+    let mut ids = roles_logic_sv2::utils::Id::new();
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (stream, _) = accept_result.expect("failed to accept downstream connection");
+                let (receiver, sender): (Receiver<EitherFrame>, Sender<EitherFrame>) =
+                    PlainConnection::new(stream).await;
+                let node = DownstreamMiningNode::new(receiver, sender, ids.next());
+
+                let mut incoming: StdFrame =
+                    node.receiver.recv().await.unwrap().try_into().unwrap();
+                let message_type = incoming.get_header().unwrap().msg_type();
+                let payload = incoming.payload();
+                let routing_logic = super::get_common_routing_logic();
+                let node = Arc::new(Sv2Mutex::new(node));
+
+                // Call handle_setup_connection or fail
+                let common_msg = DownstreamMiningNode::handle_message_common(
+                    node.clone(),
+                    message_type,
+                    payload,
+                    routing_logic
+                ).expect("failed to process downstream message");
+
+
+                if let SendToCommon::RelayNewMessageToRemote(_, relay_msg) = common_msg {
+                    if let roles_logic_sv2::parsers::CommonMessages::SetupConnectionSuccess(setup_msg) = relay_msg {
+                        DownstreamMiningNode::start(node, setup_msg).await;
+                    }
+                } else {
+                    println!("Received unexpected message from downstream");
+                }
+            }
+            _ = &mut shutdown_rx => {
+                println!("Closing listener");
+                return;
+            }
+        }
+    }
+}
+
+impl IsDownstream for DownstreamMiningNode {
+    fn get_downstream_mining_data(&self) -> CommonDownstreamData {
+        match self.status {
+            DownstreamMiningNodeStatus::Initializing => panic!(),
+            DownstreamMiningNodeStatus::Paired(data) => data,
+            DownstreamMiningNodeStatus::ChannelOpened(Channel::DownstreamHomUpstreamGroup {
+                data,
+                ..
+            }) => data,
+            DownstreamMiningNodeStatus::ChannelOpened(Channel::DownstreamHomUpstreamExtended {
+                data,
+                ..
+            }) => data,
+        }
+    }
+}
+impl IsMiningDownstream for DownstreamMiningNode {}
