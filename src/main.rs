@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use sv1_proxy::run_proxy;
 use tokio::runtime::Runtime;
 
