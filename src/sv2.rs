@@ -16,7 +16,8 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::AbortHandle;
 
 // An atomic counter to assign each miner a unique constrained extranonce.
-static MINER_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+// This is shared between SV1 and SV2 miners to ensure unique IDs across both protocols.
+pub static MINER_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 // ------------ SV2 ------------
 pub type Message = MiningDeviceMessages<'static>;
@@ -189,17 +190,17 @@ pub async fn handle_miner_sv2(
 }
 
 pub struct DownstreamMiningNode {
-    _id: u32,
-    receiver: Receiver<EitherFrame>,
-    _sender: mpsc::Sender<String>,
+    pub id: u32,
+    pub receiver: Receiver<EitherFrame>,
+    pub sender: mpsc::Sender<String>,
 }
 
 impl DownstreamMiningNode {
-    pub fn new(receiver: Receiver<EitherFrame>, _sender: mpsc::Sender<String>, _id: u32) -> Self {
+    pub fn new(receiver: Receiver<EitherFrame>, sender: mpsc::Sender<String>, id: u32) -> Self {
         Self {
-            _id,
+            id,
             receiver,
-            _sender,
+            sender,
         }
     }
 } 

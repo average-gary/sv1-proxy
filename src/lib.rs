@@ -1,25 +1,13 @@
-use async_channel::{Receiver, Sender};
-use codec_sv2::{Frame, HandshakeRole, Responder, StandardEitherFrame, StandardSv2Frame, Sv2Frame};
-use key_utils::{Secp256k1PublicKey, Secp256k1SecretKey};
-use network_helpers_sv2::noise_connection::Connection;
-use roles_logic_sv2::errors::Error as Sv2Error;
-use roles_logic_sv2::mining_sv2::{
-    Extranonce, OpenMiningChannelError, OpenStandardMiningChannelSuccess, SetCustomMiningJob, SubmitSharesExtended, SubmitSharesStandard, UpdateChannel
-};
-use roles_logic_sv2::parsers::{Mining, MiningDeviceMessages};
 use serde_json::{json, Value};
 use std::error::Error;
 use std::fs;
-use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex};
-use tokio::task::AbortHandle;
 
 mod sv2;
 
