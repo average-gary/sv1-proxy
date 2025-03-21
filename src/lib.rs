@@ -4,7 +4,7 @@ use key_utils::{Secp256k1PublicKey, Secp256k1SecretKey};
 use network_helpers_sv2::noise_connection::Connection;
 use roles_logic_sv2::errors::Error as Sv2Error;
 use roles_logic_sv2::mining_sv2::{
-    Extranonce, OpenMiningChannelError, OpenStandardMiningChannelSuccess,
+    Extranonce, OpenMiningChannelError, OpenStandardMiningChannelSuccess, SetCustomMiningJob, SubmitSharesExtended, SubmitSharesStandard, UpdateChannel
 };
 use roles_logic_sv2::parsers::{Mining, MiningDeviceMessages};
 use serde_json::{json, Value};
@@ -751,7 +751,10 @@ async fn handle_miner_sv2(
                 std::str::from_utf8(m.user_identity.as_ref()).unwrap_or("Unknown identity"),
                 m.get_request_id_as_u32()
             );
-            println!("OpenStandardMiningChannel: {:?}", m);
+            println!("Received OpenStandardMiningChannel from: {} with id: {}", 
+                std::str::from_utf8(m.user_identity.as_ref()).unwrap_or("Unknown identity"),
+                m.get_request_id_as_u32()
+            );
             let target = last_notify.lock().await.clone().unwrap().clone();
             // TODO: endianess might bite us here
             let target: [u8; 32] = target.as_bytes().try_into().unwrap();
@@ -788,79 +791,73 @@ async fn handle_miner_sv2(
             let _ = sender.send(either_frame);
             return;
         }
-        Ok(Mining::UpdateChannel(m)) => {
+        Ok(Mining::UpdateChannel(message)) => {
             // Client notifies the server about changes on the specified channel. If a client performs device/connection aggregation (i.e. it is a proxy), it MUST send this message when downstream channels change. This update can be debounced so that it is not sent more often than once in a second (for a very busy proxy).
             // Field Name	Data Type	Description
             // channel_id	U32	Channel identification
             // nominal_hash_rate	F32	See Open*Channel for details
             // maximum_target	U256	Maximum target is changed by server by sending SetTarget. This field is understood as device's request. There can be some delay between UpdateChannel and corresponding SetTarget messages, based on new job readiness on the server.
-            // When maximum_target is smaller than currently used maximum target for the channel, upstream node MUST reflect the client’s request (and send appropriate SetTarget message).
-            println!("UpdateChannel: {:?}", m);
+            // When maximum_target is smaller than currently used maximum target for the channel, upstream node MUST reflect the client's request (and send appropriate SetTarget message).
+            
+            let UpdateChannel {
+                channel_id,
+                nominal_hash_rate,
+                maximum_target,
+            } = message;
+            
+            println!("Received UpdateChannel: channel_id={}, nominal_hash_rate={}, maximum_target={:?}", 
+                channel_id, nominal_hash_rate, maximum_target);
             // TODO: handle this message. probably something with the target. For now we just log it.
         }
-        Ok(Mining::SubmitSharesStandard(m)) => {
+        Ok(Mining::SubmitSharesStandard(message)) => {
             // TODO: convert from Sv2 to Sv1 share to then submit via the share_tx
-            todo!()
-            // SupportedChannelTypes::Standard => {
-            //     debug!("Received SubmitSharesStandard->Standard message");
-            //     trace!("SubmitSharesStandard {:?}", m);
-            //     self_mutex
-            //         .safe_lock(|self_| self_.handle_submit_shares_standard(m))
-            //         .map_err(|e| crate::Error::PoisonLock(e.to_string()))?
-            // }
-            // SupportedChannelTypes::Extended => Err(Sv2Error::UnexpectedMessage(
-            //     MESSAGE_TYPE_SUBMIT_SHARES_STANDARD,
-            // )),
-            // SupportedChannelTypes::Group => {
-            //     debug!("Received SubmitSharesStandard->Group message");
-            //     trace!("SubmitSharesStandard {:?}", m);
-            //     self_mutex
-            //         .safe_lock(|self_| self_.handle_submit_shares_standard(m))
-            //         .map_err(|e| crate::Error::PoisonLock(e.to_string()))?
-            // }
-            // SupportedChannelTypes::GroupAndExtended => {
-            //     debug!("Received SubmitSharesStandard->GroupAndExtended message");
-            //     trace!("SubmitSharesStandard {:?}", m);
-            //     self_mutex
-            //         .safe_lock(|self_| self_.handle_submit_shares_standard(m))
-            //         .map_err(|e| crate::Error::PoisonLock(e.to_string()))?
-            // }
+            let SubmitSharesStandard {
+                channel_id,
+                sequence_number,
+                job_id,
+                nonce,
+                ntime,
+                version,
+            } = message;
+            println!("Received SubmitSharesStandard: channel_id={}, sequence_number={}, job_id={}, nonce={}, ntime={}, version={}", 
+                channel_id, sequence_number, job_id, nonce, ntime, version);
+
         }
-        Ok(Mining::SubmitSharesExtended(m)) => {
-            todo!()
-            // debug!("Received SubmitSharesExtended message");
-            // trace!("SubmitSharesExtended {:?}", m);
-            // match channel_type {
-            //     SupportedChannelTypes::Standard => Err(Error::UnexpectedMessage(
-            //         MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
-            //     )),
-            //     SupportedChannelTypes::Extended => self_mutex
-            //         .safe_lock(|self_| self_.handle_submit_shares_extended(m))
-            //         .map_err(|e| crate::Error::PoisonLock(e.to_string()))?,
-            //     SupportedChannelTypes::Group => Err(Error::UnexpectedMessage(
-            //         MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
-            //     )),
-            //     SupportedChannelTypes::GroupAndExtended => self_mutex
-            //         .safe_lock(|self_| self_.handle_submit_shares_extended(m))
-            //         .map_err(|e| crate::Error::PoisonLock(e.to_string()))?,
-            // }
+        Ok(Mining::SubmitSharesExtended(message)) => {
+            // TODO: convert from Sv2 to Sv1 share to then submit via the share_tx
+            let SubmitSharesExtended {
+                channel_id,
+                sequence_number,
+                job_id,
+                nonce,
+                ntime,
+                version,
+                extranonce,
+            } = message;
+            println!("Received SubmitSharesExtended: channel_id={}, sequence_number={}, job_id={}, nonce={}, ntime={}, version={}, extranonce={:?}", 
+                channel_id, sequence_number, job_id, nonce, ntime, version, extranonce);
         }
-        Ok(Mining::SetCustomMiningJob(m)) => {
-            todo!()
-            // info!(
-            //     "Received SetCustomMiningJob message for channel: {}, with id: {}",
-            //     m.channel_id, m.request_id
-            // );
-            // debug!("SetCustomMiningJob: {:?}", m);
-            // match (channel_type, is_work_selection_enabled) {
-            //     (SupportedChannelTypes::Extended, true) => self_mutex
-            //         .safe_lock(|self_| self_.handle_set_custom_mining_job(m))
-            //         .map_err(|e| crate::Error::PoisonLock(e.to_string()))?,
-            //     (SupportedChannelTypes::GroupAndExtended, true) => self_mutex
-            //         .safe_lock(|self_| self_.handle_set_custom_mining_job(m))
-            //         .map_err(|e| crate::Error::PoisonLock(e.to_string()))?,
-            //     _ => Err(Error::UnexpectedMessage(MESSAGE_TYPE_SET_CUSTOM_MINING_JOB)),
-            // }
+        Ok(Mining::SetCustomMiningJob(message)) => {
+            let SetCustomMiningJob {
+                channel_id,
+                request_id,
+                min_ntime,
+                version,
+                prev_hash,
+                nbits,
+                coinbase_tx_version,
+                coinbase_prefix,
+                coinbase_tx_input_n_sequence,
+                coinbase_tx_value_remaining,
+                coinbase_tx_outputs,
+                coinbase_tx_locktime,
+                merkle_path,
+                extranonce_size,
+                token,
+            } = message;
+            println!("ReceivedSetCustomMiningJob: channel_id={}, request_id={}, min_ntime={}, version={}, prev_hash={:?}, nbits={}, coinbase_tx_version={}, coinbase_prefix={:?}, coinbase_tx_input_n_sequence={}, coinbase_tx_value_remaining={}, coinbase_tx_outputs={:?}, coinbase_tx_locktime={}, merkle_path={:?}, extranonce_size={}, token={:?}",    
+                channel_id, request_id, min_ntime, version, prev_hash, nbits, coinbase_tx_version, coinbase_prefix, coinbase_tx_input_n_sequence, coinbase_tx_value_remaining, coinbase_tx_outputs, coinbase_tx_locktime, merkle_path, extranonce_size, token);
+            println!("THIS SHOULD NOT HAPPEN");
         }
         Ok(_) => println!("Unexpected message type: {}", message_type),
         Err(e) => println!("Error parsing message: {:?}", e),
