@@ -21,6 +21,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::AbortHandle;
 
+mod sv2;
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Config {
     keys: Keys,
@@ -34,7 +36,7 @@ struct Keys {
 
 // Structure to hold upstream job parameters.
 #[derive(Clone, Debug)]
-struct JobParams {
+pub struct JobParams {
     coinb1: String,
     coinb2: String,
     full_extranonce1: String,
