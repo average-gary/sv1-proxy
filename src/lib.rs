@@ -6,6 +6,16 @@ use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::error::Error;
 use std::env;
 
+#[derive(Debug, Clone)]
+pub enum WalletStratumMessage {
+    NewBlock(String),
+    ShareSubmitted(String),
+    DifficultyChanged(String),
+}
+
+// Channel type for wallet messages
+pub type WalletMessageChannel = (mpsc::Sender<WalletStratumMessage>, mpsc::Receiver<WalletStratumMessage>);
+
 // Structure to hold upstream job parameters.
 #[derive(Clone, Debug)]
 struct JobParams {
@@ -34,6 +44,8 @@ pub async fn run_proxy(
     worker_name: &str,
     on_new_block: Arc<dyn Fn(String) + Send + Sync + 'static>,
     on_share_submitted: Arc<dyn Fn(String) + Send + Sync + 'static>,
+    tx_to_wallet: mpsc::Sender<WalletStratumMessage>,
+    rx_from_wallet: mpsc::Receiver<WalletStratumMessage>
 ) -> Result<(), Box<dyn Error>> {
     // Connect to the upstream pool.
     let mut upstream_stream = TcpStream::connect(&upstream_addr).await?;
@@ -106,8 +118,9 @@ pub async fn run_proxy(
         let last_notify = last_notify.clone();
         let last_difficulty = last_difficulty.clone();
         let last_prev_hash = last_prev_hash.clone();
+        let tx_to_wallet = tx_to_wallet.clone();
         tokio::spawn(async move {
-            upstream_read_handler(upstream_reader, job_tx, job_params, last_notify, last_difficulty, on_new_block, last_prev_hash).await;
+            upstream_read_handler(upstream_reader, job_tx, job_params, last_notify, last_difficulty, on_new_block, last_prev_hash, wallet_tx).await;
         });
     }
 
@@ -151,6 +164,7 @@ async fn upstream_read_handler(
     last_difficutly: SharedLastDifficulty,
     on_new_block: Arc<dyn Fn(String) + Send + Sync + 'static>,
     last_prev_hash: SharedLastPrevHash,
+    tx_to_wallet: mpsc::Sender<WalletStratumMessage>,
 ) {
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
@@ -175,7 +189,6 @@ async fn upstream_read_handler(
                                 if let Some(prevhash_json) = params.get(1) {
                                     let new_prevhash = prevhash_json.as_str().unwrap_or("").to_string();
 
-
                                     let mut last_hash_guard = last_prev_hash.lock().await;
                                     let changed = match &*last_hash_guard {
                                         Some(old_hash) => *old_hash != new_prevhash,
@@ -185,6 +198,7 @@ async fn upstream_read_handler(
                                     if changed {
                                         *last_hash_guard = Some(new_prevhash);
                                         on_new_block(trimmed.to_string());
+                                        let _ = tx_to_wallet.send(WalletStratumMessage::NewBlock(trimmed.to_string())).await;
                                     }
                                 }
                             }
@@ -210,6 +224,7 @@ async fn upstream_read_handler(
                                     *last_lock = Some(trimmed.to_string());
                                     // Broadcast the set_difficulty message downstream
                                     let _ = job_tx.send(trimmed.to_string());
+                                    let _ = tx_to_wallet.send(WalletStratumMessage::DifficultyChanged(trimmed.to_string())).await;
                                 }
                             }
                             continue;
@@ -556,10 +571,29 @@ fn transform_share_submission(submission: &str, constrained_extranonce: &str, fu
     }
 }
 
-pub async fn run_wallet() -> Result<(), Box<dyn Error>> {
+pub async fn run_wallet(
+    mut rx_to_wallet: mpsc::Receiver<WalletStratumMessage>,
+    tx_to_proxy: mpsc::Sender<WalletStratumMessage>,
+) -> Result<(), Box<dyn Error>> {
     println!("Starting wallet operations...");
-    // TODO: Implement wallet functionality
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    
+    while let Some(message) = rx_to_wallet.recv().await {
+        match message {
+            WalletStratumMessage::NewBlock(msg) => {
+                println!("Wallet received new block: {}", msg);
+                // TODO: Handle new block in wallet
+            }
+            WalletStratumMessage::ShareSubmitted(msg) => {
+                println!("Wallet received share submission: {}", msg);
+                // TODO: Handle share submission in wallet
+            }
+            WalletStratumMessage::DifficultyChanged(msg) => {
+                println!("Wallet received difficulty change: {}", msg);
+                // TODO: Handle difficulty change in wallet
+            }
+        }
+    }
+    
     println!("Wallet operations completed!");
     Ok(())
 }

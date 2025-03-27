@@ -1,7 +1,8 @@
-use sv1_proxy::{run_proxy, run_wallet};
+use sv1_proxy::{run_proxy, run_wallet, WalletMessageChannel};
 use tokio::runtime::Runtime;
 use std::sync::Arc;
 use tokio::select;
+use tokio::sync::mpsc;
 
 fn main() {
     if let Err(e) = run() {
@@ -28,14 +29,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     rt.block_on(async {
+        let (tx_to_wallet, rx_to_wallet) = mpsc::channel(100);
+        let (tx_from_wallet, rx_from_wallet) = mpsc::channel(100);
+
         let proxy_future = run_proxy(
             &upstream_addr,
             &worker_name,
             on_new_block,
             on_share_submitted,
+            tx_to_wallet,
+            rx_from_wallet,
         );
 
-        let wallet_future = run_wallet();
+        let wallet_future = run_wallet(rx_to_wallet, tx_from_wallet);
 
         select! {
             result = proxy_future => result,
