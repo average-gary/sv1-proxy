@@ -287,7 +287,7 @@ async fn upstream_write_handler(
 }
 
 /// Handles a miner connection:
-/// - Responds to the miner’s subscribe with a constrained extranonce.
+/// - Responds to the miner's subscribe with a constrained extranonce.
 /// - Sends the current cached mining.notify if available.
 /// - Forwards mining.notify messages (modified for the miner) and transforms share submissions.
 async fn handle_miner(
@@ -308,7 +308,7 @@ async fn handle_miner(
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
 
-    // Read the miner’s configure request.
+    // Read the miner's configure request.
     if let Ok(n) = reader.read_line(&mut line).await {
         if n > 0 {
             println!("Miner {} sent: {}", miner_id, line.trim_end());
@@ -343,7 +343,7 @@ async fn handle_miner(
         return;
     }
 
-    // Read the miner’s subscribe request.
+    // Read the miner's subscribe request.
     if let Ok(n) = reader.read_line(&mut line).await {
         if n > 0 {
             println!("Miner {} sent: {}", miner_id, line.trim_end());
@@ -391,7 +391,7 @@ async fn handle_miner(
         return;
     }
 
-    // Read the miner’s authorize request.
+    // Read the miner's authorize request.
     if let Ok(n) = reader.read_line(&mut line).await {
         if n > 0 {
             println!("Miner {} sent: {}", miner_id, line.trim_end());
@@ -535,7 +535,7 @@ async fn handle_miner(
     }
 }
 
-/// Transforms a miner’s share submission by replacing the constrained extranonce with the full upstream extranonce.
+/// Transforms a miner's share submission by replacing the constrained extranonce with the full upstream extranonce.
 fn transform_share_submission(submission: &str, constrained_extranonce: &str, full_extranonce: &str, worker_name: &str) -> String {
     if let Ok(mut value) = serde_json::from_str::<Value>(submission) {
         if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
@@ -554,4 +554,12 @@ fn transform_share_submission(submission: &str, constrained_extranonce: &str, fu
     } else {
         submission.to_string()
     }
+}
+
+pub async fn run_wallet() -> Result<(), Box<dyn Error>> {
+    println!("Starting wallet operations...");
+    // TODO: Implement wallet functionality
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    println!("Wallet operations completed!");
+    Ok(())
 }
