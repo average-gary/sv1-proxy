@@ -1,5 +1,7 @@
 use sv1_proxy::run_proxy;
 use tokio::runtime::Runtime;
+use std::sync::Arc;
+use tokio::select;
 
 fn main() {
     if let Err(e) = run() {
@@ -26,11 +28,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     rt.block_on(async {
-        run_proxy(
+        let proxy_future = run_proxy(
             &upstream_addr,
             &worker_name,
             on_new_block,
             on_share_submitted,
-        ).await
+        );
+
+        let other_future = async {
+            // Simulate some other async work
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            println!("Other async work completed!");
+            Ok(())
+        };
+
+        select! {
+            result = proxy_future => result,
+            result = other_future => result,
+        }
     })
 }
